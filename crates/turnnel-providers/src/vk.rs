@@ -12,11 +12,6 @@ use turnnel_session::session::TurnCredentials;
 
 use crate::CredentialProvider;
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Constants — extracted from the VK Calls browser JS bundle.
-//  If VK updates their app, change these values.
-// ═══════════════════════════════════════════════════════════════════════════
-
 const VK_CLIENT_ID: &str = "6287487";
 const VK_CLIENT_SECRET: &str = "QbYic1K3lEV5kTGiqlq2";
 const VK_APP_ID: &str = "6287487";
@@ -29,7 +24,8 @@ const OK_API_URL: &str = "https://calls.okcdn.ru/fb.do";
 const OK_APP_KEY: &str = "CGMMEJLGDIHBABABA";
 
 const OK_SESSION_VERSION: u32 = 2;
-const OK_CLIENT_VERSION: &str = "1.1";
+// Issue 9: use f64 constant so the type matches how it's used in serde_json::json!
+const OK_CLIENT_VERSION: f64 = 1.1;
 const OK_CLIENT_TYPE: &str = "SDK_JS";
 const OK_PROTOCOL_VERSION: &str = "5";
 
@@ -55,7 +51,7 @@ impl VkProvider {
         let join_link = extract_join_link(&call_url).ok_or_else(|| {
             anyhow::anyhow!(
                 "could not extract join link from: {call_url}\n\
-                 Expected format: https://vk.com/call/join/XXXXX"
+                 Expected format: https://vk.com/call/join/<link>"
             )
         })?;
 
@@ -165,8 +161,9 @@ impl VkProvider {
             .text()
             .await?;
 
-        let resp: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("step 1: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+        let resp: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("step 1: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300))
+        })?;
 
         resp["data"]["access_token"]
             .as_str()
@@ -194,8 +191,9 @@ impl VkProvider {
             .text()
             .await?;
 
-        let resp: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("step 2: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+        let resp: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("step 2: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300))
+        })?;
 
         if let Some(err) = resp.get("error") {
             let msg = err
@@ -212,12 +210,17 @@ impl VkProvider {
             .ok_or_else(|| anyhow::anyhow!("step 2: no response.token — {}", trunc(&resp, 300)))
     }
 
+    // Issue 9: use serde_json::json! consistently (matches auth_token_flow)
     async fn step3_ok_session_key(&self) -> anyhow::Result<String> {
         let device_id = uuid_v4();
 
-        let session_json = format!(
-            r#"{{"version":{OK_SESSION_VERSION},"device_id":"{device_id}","client_version":{OK_CLIENT_VERSION},"client_type":"{OK_CLIENT_TYPE}"}}"#
-        );
+        let session_data = serde_json::json!({
+            "version": OK_SESSION_VERSION,
+            "device_id": device_id,
+            "client_version": OK_CLIENT_VERSION,
+            "client_type": OK_CLIENT_TYPE,
+        });
+        let session_json = serde_json::to_string(&session_data)?;
 
         let body = format!(
             "session_data={}\
@@ -237,8 +240,9 @@ impl VkProvider {
             .text()
             .await?;
 
-        let resp: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("step 3: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+        let resp: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("step 3: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300))
+        })?;
 
         resp["session_key"]
             .as_str()
@@ -273,8 +277,9 @@ impl VkProvider {
             .text()
             .await?;
 
-        let resp: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("step 4: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+        let resp: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("step 4: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300))
+        })?;
 
         if let Some(msg) = resp.get("error_msg").and_then(|m| m.as_str()) {
             anyhow::bail!("step 4: OK API error: {msg}");
@@ -289,12 +294,13 @@ impl VkProvider {
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl VkProvider {
+    // Issue 9: use serde_json::json! with the same typed constants
     async fn auth_token_flow(&self, auth_token: &str) -> anyhow::Result<TurnCredentials> {
         let device_id = uuid_v4();
         let session_data = serde_json::json!({
             "version": OK_SESSION_VERSION,
             "device_id": device_id,
-            "client_version": 1.1,
+            "client_version": OK_CLIENT_VERSION,
             "client_type": OK_CLIENT_TYPE,
             "auth_token": auth_token,
         });

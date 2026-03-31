@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tokio::signal;
 
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -105,10 +106,20 @@ pub async fn run(config: PeerConfig) -> anyhow::Result<()> {
                     );
                 }
             }
+
+            // Issue 10: graceful shutdown on Ctrl+C
+            _ = signal::ctrl_c() => {
+                tracing::info!("received Ctrl+C, stopping relay");
+                return Ok(());
+            }
         }
     }
 }
 
+/// Issue 7: Returns the relay address with the most recent activity.
+///
+/// This is O(n) over the number of known relays. In practice n is tiny
+/// (typically 1–2 relays), so a linear scan is perfectly adequate.
 fn freshest_relay(relays: &HashMap<SocketAddr, RelayEntry>) -> Option<SocketAddr> {
     relays
         .iter()

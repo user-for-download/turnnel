@@ -184,8 +184,14 @@ where
     async fn recv(&mut self) -> anyhow::Result<(Bytes, SocketAddr)> {
         match self.stream.next().await {
             Some(Ok(bytes)) => Ok((bytes, self.server_addr)),
-            Some(Err(e)) => anyhow::bail!("Stream read error: {}", e),
-            None => anyhow::bail!("Stream closed by server"),
+            // Issue 8: preserve the original io::Error so ErrorKind is available
+            // to is_disconnect_error() in session.rs
+            Some(Err(e)) => Err(e.into()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream closed by server",
+            )
+            .into()),
         }
     }
 

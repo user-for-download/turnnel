@@ -199,7 +199,8 @@ async fn test_send_data_before_establish_fails() {
     let (server_addr, _handle) = start_mock_turn().await;
     let config = test_config(server_addr);
 
-    let session = TurnSession::new(config).await.unwrap();
+    // Issue 4: send_data now takes &mut self
+    let mut session = TurnSession::new(config).await.unwrap();
     let result = session.send_data(b"too early").await;
     assert!(result.is_err());
 }
@@ -317,11 +318,9 @@ async fn test_reconnect_to_live_server() {
     session.establish().await.unwrap();
     assert_eq!(session.state(), SessionState::Active);
 
-    // Reconnect should re-establish successfully against the same mock server
     session.reconnect().await.unwrap();
     assert_eq!(session.state(), SessionState::Active);
 
-    // Data should still work after reconnect
     session.send_data(b"after-reconnect").await.unwrap();
     let resp = session.recv_data().await.unwrap();
     assert_eq!(&resp[..], b"echo:after-reconnect");

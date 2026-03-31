@@ -1,7 +1,7 @@
-// FILE: crates/turnnel-session/src/codec.rs
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use turnnel_stun::channel_data::CHANNEL_DATA_HEADER;
+use turnnel_stun::integrity::MAGIC_COOKIE;
 use turnnel_stun::message::HEADER_SIZE;
 use turnnel_stun::{demux, PacketType};
 
@@ -21,6 +21,14 @@ impl Decoder for TurnCodec {
                 if src.len() < HEADER_SIZE {
                     return Ok(None);
                 }
+
+                // Issue 6: validate magic cookie before trusting the length field
+                let cookie = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
+                if cookie != MAGIC_COOKIE {
+                    src.advance(1);
+                    return Ok(None);
+                }
+
                 let len = u16::from_be_bytes([src[2], src[3]]) as usize;
                 let total = HEADER_SIZE + len;
 

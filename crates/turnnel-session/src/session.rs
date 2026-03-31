@@ -12,12 +12,26 @@ use turnnel_stun::{demux, PacketType};
 
 use crate::transport::{TransportProtocol, TransportRx, TransportTx};
 
-#[derive(Debug, Clone)]
+const MAX_PENDING_DATA: usize = 1024;
+
+#[derive(Clone)]
 pub struct TurnCredentials {
     pub server_addr: SocketAddr,
     pub username: String,
     pub password: String,
     pub realm: Option<String>,
+}
+
+// Issue 1: mask password in Debug output to prevent accidental leakage in logs
+impl std::fmt::Debug for TurnCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnCredentials")
+            .field("server_addr", &self.server_addr)
+            .field("username", &self.username)
+            .field("password", &"********")
+            .field("realm", &self.realm)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +135,6 @@ pub struct TurnSession {
     last_permission_refresh: Option<Instant>,
     last_channel_refresh: Option<Instant>,
 
-    /// ChannelData frames received while waiting for a STUN response
     pending_data: VecDeque<Bytes>,
 }
 
@@ -296,6 +309,11 @@ impl TurnSession {
     }
 
     fn handle_allocate_success(&mut self, resp: &StunMessage) -> Result<(), SessionError> {
+        // Issue 5: update nonce from any success response (RFC 5766 §7.3)
+        if let Some(nonce) = resp.get_nonce() {
+            self.server_nonce = Some(nonce.to_string());
+        }
+
         let relay_addr = resp
             .get_xor_relayed_address()
             .ok_or(SessionError::NoRelayAddress)?;
@@ -363,6 +381,12 @@ impl TurnSession {
                 self.state = SessionState::Permitted;
             }
             self.last_permission_refresh = Some(Instant::now());
+
+            // Issue 5: update nonce from success response
+            if let Some(nonce) = resp.get_nonce() {
+                self.server_nonce = Some(nonce.to_string());
+            }
+
             return Ok(());
         }
 
@@ -406,6 +430,12 @@ impl TurnSession {
 
             self.state = SessionState::Active;
             self.last_channel_refresh = Some(Instant::now());
+
+            // Issue 5: update nonce from success response
+            if let Some(nonce) = resp.get_nonce() {
+                self.server_nonce = Some(nonce.to_string());
+            }
+
             return Ok(());
         }
 
@@ -415,7 +445,10 @@ impl TurnSession {
         })
     }
 
-    pub async fn send_data(&self, payload: &[u8]) -> Result<(), SessionError> {
+    // Issue 4: &mut self is semantically correct for an I/O operation
+    // and prevents the compiler from allowing concurrent sends that could
+    // interleave channel data frames on TCP.
+    pub async fn send_data(&mut self, payload: &[u8]) -> Result<(), SessionError> {
         if self.state != SessionState::Active {
             return Err(SessionError::WrongState {
                 required: SessionState::Active,
@@ -504,6 +537,12 @@ impl TurnSession {
                 alloc.lifetime = resp.get_lifetime().unwrap_or(alloc.lifetime);
                 alloc.allocated_at = Instant::now();
             }
+
+            // Issue 5: update nonce from success response
+            if let Some(nonce) = resp.get_nonce() {
+                self.server_nonce = Some(nonce.to_string());
+            }
+
             return Ok(());
         }
 
@@ -594,8 +633,8 @@ impl TurnSession {
         match self.rx.recv().await {
             Ok(r) => Ok(r),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("closed") || msg.contains("broken pipe") || msg.contains("reset") {
+                // Issue 8: use io::ErrorKind instead of string matching
+                if is_disconnect_error(&e) {
                     Err(SessionError::Disconnected)
                 } else {
                     Err(SessionError::Transport(e))
@@ -612,8 +651,8 @@ impl TurnSession {
         match self.rx.recv_timeout(timeout).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("closed") || msg.contains("broken pipe") || msg.contains("reset") {
+                // Issue 8: use io::ErrorKind instead of string matching
+                if is_disconnect_error(&e) {
                     Err(SessionError::Disconnected)
                 } else {
                     Err(SessionError::Transport(e))
@@ -647,7 +686,12 @@ impl TurnSession {
                     // Buffer the ChannelData so it isn't lost
                     match ChannelData::decode(&frame) {
                         Ok(cd) => {
-                            self.pending_data.push_back(cd.data);
+                            // Issue 3: cap pending_data to prevent OOM
+                            if self.pending_data.len() < MAX_PENDING_DATA {
+                                self.pending_data.push_back(cd.data);
+                            } else {
+                                tracing::warn!("pending_data queue full, dropping channel data");
+                            }
                         }
                         Err(e) => {
                             tracing::trace!("ignoring malformed ChannelData during STUN wait: {e}");
@@ -698,10 +742,14 @@ impl TurnSession {
         })
     }
 
+    // Issue 12: guard against lifetime 0 to prevent refresh storms
     pub fn needs_allocation_refresh(&self) -> bool {
         self.allocation
             .as_ref()
-            .map(|a| a.allocated_at.elapsed() >= Duration::from_secs(a.lifetime as u64 / 2))
+            .map(|a| {
+                a.lifetime > 0
+                    && a.allocated_at.elapsed() >= Duration::from_secs(a.lifetime as u64 / 2)
+            })
             .unwrap_or(false)
     }
 
@@ -715,5 +763,20 @@ impl TurnSession {
         self.last_channel_refresh
             .map(|t| t.elapsed() >= Duration::from_secs(250))
             .unwrap_or(false)
+    }
+}
+
+// Issue 8: detect disconnection via io::ErrorKind rather than string matching
+fn is_disconnect_error(e: &anyhow::Error) -> bool {
+    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    } else {
+        false
     }
 }

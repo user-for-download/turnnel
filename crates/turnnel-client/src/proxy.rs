@@ -18,11 +18,23 @@ pub struct ProxyConfig {
 }
 
 pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
-    let session_config = SessionConfig::new(
-        config.credentials.clone(),
-        config.protocol.clone(),
-        config.peer_addr,
-    );
+    let wg_socket = UdpSocket::bind(config.listen_addr).await?;
+    tracing::info!(listen = %config.listen_addr, "WireGuard proxy ready");
+    run_inner(config, wg_socket).await
+}
+
+// Issue 2: accept a pre-bound socket to eliminate the TOCTOU race in tests
+pub async fn run_with_listener(config: ProxyConfig, wg_socket: UdpSocket) -> anyhow::Result<()> {
+    tracing::info!(listen = %wg_socket.local_addr()?, "WireGuard proxy ready (pre-bound)");
+    run_inner(config, wg_socket).await
+}
+
+async fn run_inner(config: ProxyConfig, wg_socket: UdpSocket) -> anyhow::Result<()> {
+    // Issue 11: take ownership instead of cloning
+    let refresh_interval = config.refresh_interval;
+    let peer_addr = config.peer_addr;
+
+    let session_config = SessionConfig::new(config.credentials, config.protocol, peer_addr);
 
     let mut session = TurnSession::new(session_config).await?;
     session.establish().await?;
@@ -32,14 +44,11 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         .expect("must have relay after establish");
     tracing::info!(
         relay = %relay,
-        peer = %config.peer_addr,
+        peer = %peer_addr,
         "TURN tunnel established"
     );
 
-    let wg_socket = UdpSocket::bind(config.listen_addr).await?;
-    tracing::info!(listen = %config.listen_addr, "WireGuard proxy ready");
-
-    let result = run_data_loop(&mut session, &wg_socket, config.refresh_interval).await;
+    let result = run_data_loop(&mut session, &wg_socket, refresh_interval).await;
 
     tracing::info!("shutting down, releasing TURN allocation");
     if let Err(e) = session.deallocate().await {
@@ -265,9 +274,9 @@ mod tests {
     async fn test_proxy_roundtrip() {
         let turn_addr = start_mock_turn().await;
 
-        let proxy_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_sock.local_addr().unwrap();
-        drop(proxy_sock);
+        // Issue 2: bind once and pass the socket directly — no TOCTOU race
+        let wg_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = wg_socket.local_addr().unwrap();
 
         let config = ProxyConfig {
             listen_addr: proxy_addr,
@@ -283,7 +292,7 @@ mod tests {
         };
 
         let proxy_handle = tokio::spawn(async move {
-            if let Err(e) = run(config).await {
+            if let Err(e) = run_with_listener(config, wg_socket).await {
                 tracing::error!("proxy error: {e}");
             }
         });
