@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[package]
+name = "turnnel"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+turnnel-stun = { path = "crates/turnnel-stun" }
+turnnel-session = { path = "crates/turnnel-session" }
+turnnel-client = { path = "crates/turnnel-client" }
+turnnel-peer = { path = "crates/turnnel-peer" }
+turnnel-providers = { path = "crates/turnnel-providers" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
