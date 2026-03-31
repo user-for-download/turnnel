@@ -1,5 +1,3 @@
-//! Тесты TurnSession с мок-TURN-сервером.
-
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -15,25 +13,19 @@ use turnnel_stun::{demux, PacketType};
 
 use crate::session::{SessionConfig, SessionState, TurnCredentials, TurnSession};
 
-// ── Мок TURN сервер ──
-
 const TEST_USERNAME: &str = "testuser";
 const TEST_PASSWORD: &str = "testpass";
 const TEST_REALM: &str = "test.realm";
 const TEST_NONCE: &str = "testnonce123";
 
-/// Fake relay address, который "выделяет" наш мок-сервер.
 fn fake_relay_addr() -> SocketAddr {
     SocketAddr::new(Ipv4Addr::new(198, 51, 100, 1).into(), 49152)
 }
 
-/// Fake mapped address.
 fn fake_mapped_addr() -> SocketAddr {
     SocketAddr::new(Ipv4Addr::new(203, 0, 113, 50).into(), 12345)
 }
 
-/// Запускает минимальный мок TURN-сервер.
-/// Возвращает адрес, на котором он слушает.
 async fn start_mock_turn() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
@@ -71,13 +63,11 @@ async fn mock_turn_loop(socket: UdpSocket) {
                 }
             }
             PacketType::ChannelData => {
-                // Эхо: отправляем обратно те же данные через ChannelData
                 let cd = match ChannelData::decode(frame) {
                     Ok(cd) => cd,
                     Err(_) => continue,
                 };
 
-                // Эхо с префиксом "echo:"
                 let mut echo_data = b"echo:".to_vec();
                 echo_data.extend_from_slice(&cd.data);
 
@@ -102,14 +92,12 @@ fn handle_stun_request(req: &StunMessage, hmac_key: &[u8]) -> Option<StunMessage
 }
 
 fn handle_allocate(req: &StunMessage, _hmac_key: &[u8]) -> StunMessage {
-    // Проверяем наличие credentials
     let has_username = req
         .attributes
         .iter()
         .any(|a| matches!(a, Attribute::Username(_)));
 
     if !has_username {
-        // Первый запрос без credentials → 401
         let mut resp = StunMessage::new(Method::Allocate, Class::ErrorResponse);
         resp.transaction_id = req.transaction_id;
         resp.add(Attribute::ErrorCode {
@@ -121,10 +109,6 @@ fn handle_allocate(req: &StunMessage, _hmac_key: &[u8]) -> StunMessage {
         return resp;
     }
 
-    // Проверяем MESSAGE-INTEGRITY (необязательно для мока, но полезно)
-    // В реальном сервере здесь была бы полная проверка
-
-    // Успешный Allocate
     let mut resp = StunMessage::new(Method::Allocate, Class::SuccessResponse);
     resp.transaction_id = req.transaction_id;
     resp.add(Attribute::XorRelayedAddress(fake_relay_addr()));
@@ -153,8 +137,6 @@ fn handle_refresh(req: &StunMessage, _hmac_key: &[u8]) -> StunMessage {
     resp
 }
 
-// ── Тесты ──
-
 fn test_config(server_addr: SocketAddr) -> SessionConfig {
     let peer_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9999);
     SessionConfig::new(
@@ -162,9 +144,9 @@ fn test_config(server_addr: SocketAddr) -> SessionConfig {
             server_addr,
             username: TEST_USERNAME.into(),
             password: TEST_PASSWORD.into(),
-            realm: None, // будет получен из 401
+            realm: None,
         },
-        crate::transport::TransportProtocol::Udp, // <--- ДОБАВЛЕНО
+        crate::transport::TransportProtocol::Udp,
         peer_addr,
     )
 }
@@ -180,7 +162,6 @@ async fn test_full_session_establish() {
     session.establish().await.unwrap();
     assert_eq!(session.state(), SessionState::Active);
 
-    // Проверяем allocation info
     let info = session.allocation_info().unwrap();
     assert_eq!(info.relay_addr, fake_relay_addr());
     assert_eq!(info.mapped_addr, Some(fake_mapped_addr()));
@@ -207,10 +188,8 @@ async fn test_send_recv_channel_data() {
     let mut session = TurnSession::new(config).await.unwrap();
     session.establish().await.unwrap();
 
-    // Отправляем данные
     session.send_data(b"hello").await.unwrap();
 
-    // Мок-сервер эхоит с префиксом "echo:"
     let response = session.recv_data().await.unwrap();
     assert_eq!(&response[..], b"echo:hello");
 }
@@ -233,10 +212,8 @@ async fn test_refresh_allocation() {
     let mut session = TurnSession::new(config).await.unwrap();
     session.establish().await.unwrap();
 
-    // Refresh должен пройти
     session.refresh_allocation().await.unwrap();
 
-    // Состояние должно остаться Active
     assert_eq!(session.state(), SessionState::Active);
 }
 
@@ -273,7 +250,7 @@ async fn test_time_until_expiry() {
     session.establish().await.unwrap();
 
     let remaining = session.time_until_expiry().unwrap();
-    // Должно быть ~600с (минус несколько ms на тест)
+
     assert!(remaining > Duration::from_secs(599));
     assert!(remaining <= Duration::from_secs(600));
 }
@@ -286,7 +263,6 @@ async fn test_needs_refresh_initially_false() {
     let mut session = TurnSession::new(config).await.unwrap();
     session.establish().await.unwrap();
 
-    // Только что создали — refresh не нужен
     assert!(!session.needs_allocation_refresh());
     assert!(!session.needs_permission_refresh());
     assert!(!session.needs_channel_refresh());
@@ -312,13 +288,12 @@ async fn test_multiple_send_recv() {
 
 #[tokio::test]
 async fn test_timeout_on_dead_server() {
-    // Привязываем сокет, но НЕ запускаем сервер → timeout
     let dead_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead_socket.local_addr().unwrap();
     drop(dead_socket);
 
     let mut config = test_config(dead_addr);
-    config.stun_timeout = Duration::from_millis(200); // быстрый таймаут для теста
+    config.stun_timeout = Duration::from_millis(200);
 
     let mut session = TurnSession::new(config).await.unwrap();
     let result = session.establish().await;
@@ -329,4 +304,25 @@ async fn test_timeout_on_dead_server() {
         err_str.contains("timeout") || err_str.contains("Timeout"),
         "expected timeout error, got: {err_str}"
     );
+}
+
+#[tokio::test]
+async fn test_reconnect_to_live_server() {
+    let (server_addr, _handle) = start_mock_turn().await;
+    let mut config = test_config(server_addr);
+    config.max_reconnect_attempts = 3;
+    config.reconnect_delay = Duration::from_millis(50);
+
+    let mut session = TurnSession::new(config).await.unwrap();
+    session.establish().await.unwrap();
+    assert_eq!(session.state(), SessionState::Active);
+
+    // Reconnect should re-establish successfully against the same mock server
+    session.reconnect().await.unwrap();
+    assert_eq!(session.state(), SessionState::Active);
+
+    // Data should still work after reconnect
+    session.send_data(b"after-reconnect").await.unwrap();
+    let resp = session.recv_data().await.unwrap();
+    assert_eq!(&resp[..], b"echo:after-reconnect");
 }

@@ -1,4 +1,4 @@
-// FILE: crates/turnnel-session/src/session.rs
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,8 @@ pub struct SessionConfig {
     pub channel_number: u16,
     pub stun_timeout: Duration,
     pub requested_lifetime: u32,
+    pub max_reconnect_attempts: u32,
+    pub reconnect_delay: Duration,
 }
 
 impl SessionConfig {
@@ -43,6 +45,8 @@ impl SessionConfig {
             channel_number: 0x4000,
             stun_timeout: Duration::from_secs(5),
             requested_lifetime: 600,
+            max_reconnect_attempts: 3,
+            reconnect_delay: Duration::from_secs(2),
         }
     }
 }
@@ -93,6 +97,12 @@ pub enum SessionError {
         current: SessionState,
     },
 
+    #[error("transport disconnected")]
+    Disconnected,
+
+    #[error("reconnection failed after {attempts} attempts")]
+    ReconnectFailed { attempts: u32 },
+
     #[error(transparent)]
     Transport(#[from] anyhow::Error),
 }
@@ -110,6 +120,9 @@ pub struct TurnSession {
 
     last_permission_refresh: Option<Instant>,
     last_channel_refresh: Option<Instant>,
+
+    /// ChannelData frames received while waiting for a STUN response
+    pending_data: VecDeque<Bytes>,
 }
 
 impl TurnSession {
@@ -128,6 +141,7 @@ impl TurnSession {
             allocation: None,
             last_permission_refresh: None,
             last_channel_refresh: None,
+            pending_data: VecDeque::new(),
         })
     }
 
@@ -144,6 +158,44 @@ impl TurnSession {
             "TURN session active"
         );
 
+        Ok(())
+    }
+
+    pub async fn deallocate(&mut self) -> Result<(), SessionError> {
+        if self.state == SessionState::Init || self.hmac_key.is_none() {
+            return Ok(());
+        }
+
+        let mut req = StunMessage::new(Method::Refresh, Class::Request);
+        req.add(Attribute::Lifetime(0));
+        self.add_auth_attrs(&mut req);
+
+        let key = self.hmac_key.as_ref().unwrap();
+        let encoded = req.encode(Some(key), false);
+        self.tx.send(encoded.freeze()).await?;
+
+        match self
+            .recv_stun_response(Method::Refresh, &req.transaction_id)
+            .await
+        {
+            Ok(resp) => {
+                if resp.class == Class::SuccessResponse {
+                    tracing::info!("TURN allocation released");
+                } else {
+                    let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
+                    tracing::warn!(code, reason, "deallocate got error response");
+                }
+            }
+            Err(SessionError::Timeout) => {
+                tracing::debug!("deallocate response timed out (allocation will expire naturally)");
+            }
+            Err(e) => {
+                tracing::debug!("deallocate failed: {e}");
+            }
+        }
+
+        self.state = SessionState::Init;
+        self.allocation = None;
         Ok(())
     }
 
@@ -263,61 +315,104 @@ impl TurnSession {
     }
 
     async fn create_permission(&mut self) -> Result<(), SessionError> {
-        let peer_ip = self.config.peer_addr.ip();
-        let perm_addr = SocketAddr::new(peer_ip, 0);
+        for attempt in 0..2u8 {
+            let peer_ip = self.config.peer_addr.ip();
+            let perm_addr = SocketAddr::new(peer_ip, 0);
 
-        let mut req = StunMessage::new(Method::CreatePermission, Class::Request);
-        req.add(Attribute::XorPeerAddress(perm_addr));
-        self.add_auth_attrs(&mut req);
+            let mut req = StunMessage::new(Method::CreatePermission, Class::Request);
+            req.add(Attribute::XorPeerAddress(perm_addr));
+            self.add_auth_attrs(&mut req);
 
-        let key = self.hmac_key.as_ref().unwrap();
-        let encoded = req.encode(Some(key), false);
-        self.tx.send(encoded.freeze()).await?;
+            let key = self.hmac_key.as_ref().unwrap();
+            let encoded = req.encode(Some(key), false);
+            self.tx.send(encoded.freeze()).await?;
 
-        let resp = self
-            .recv_stun_response(Method::CreatePermission, &req.transaction_id)
-            .await?;
+            let resp = self
+                .recv_stun_response(Method::CreatePermission, &req.transaction_id)
+                .await?;
 
-        if resp.class == Class::ErrorResponse {
-            let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
-            return Err(SessionError::TurnError {
-                code,
-                reason: reason.to_string(),
-            });
+            if resp.class == Class::ErrorResponse {
+                let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
+
+                if code == 438 && attempt == 0 {
+                    if let Some(new_nonce) = resp.get_nonce() {
+                        tracing::debug!("stale nonce on CreatePermission, retrying");
+                        self.server_nonce = Some(new_nonce.to_string());
+                        continue;
+                    }
+                }
+
+                if code == 403 {
+                    return Err(SessionError::TurnError {
+                        code,
+                        reason: format!(
+                            "{reason} — the TURN server refused to create a permission for peer IP {peer_ip}. \
+                             This typically means the address is loopback/private/reserved. \
+                             Use the PUBLIC IP of the peer machine.",
+                        ),
+                    });
+                }
+
+                return Err(SessionError::TurnError {
+                    code,
+                    reason: reason.to_string(),
+                });
+            }
+
+            if self.state == SessionState::Allocated {
+                self.state = SessionState::Permitted;
+            }
+            self.last_permission_refresh = Some(Instant::now());
+            return Ok(());
         }
 
-        if self.state == SessionState::Allocated {
-            self.state = SessionState::Permitted;
-        }
-        self.last_permission_refresh = Some(Instant::now());
-        Ok(())
+        Err(SessionError::TurnError {
+            code: 438,
+            reason: "stale nonce persisted on CreatePermission".into(),
+        })
     }
 
     async fn channel_bind(&mut self) -> Result<(), SessionError> {
-        let mut req = StunMessage::new(Method::ChannelBind, Class::Request);
-        req.add(Attribute::ChannelNumber(self.config.channel_number));
-        req.add(Attribute::XorPeerAddress(self.config.peer_addr));
-        self.add_auth_attrs(&mut req);
+        for attempt in 0..2u8 {
+            let mut req = StunMessage::new(Method::ChannelBind, Class::Request);
+            req.add(Attribute::ChannelNumber(self.config.channel_number));
+            req.add(Attribute::XorPeerAddress(self.config.peer_addr));
+            self.add_auth_attrs(&mut req);
 
-        let key = self.hmac_key.as_ref().unwrap();
-        let encoded = req.encode(Some(key), false);
-        self.tx.send(encoded.freeze()).await?;
+            let key = self.hmac_key.as_ref().unwrap();
+            let encoded = req.encode(Some(key), false);
+            self.tx.send(encoded.freeze()).await?;
 
-        let resp = self
-            .recv_stun_response(Method::ChannelBind, &req.transaction_id)
-            .await?;
+            let resp = self
+                .recv_stun_response(Method::ChannelBind, &req.transaction_id)
+                .await?;
 
-        if resp.class == Class::ErrorResponse {
-            let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
-            return Err(SessionError::TurnError {
-                code,
-                reason: reason.to_string(),
-            });
+            if resp.class == Class::ErrorResponse {
+                let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
+
+                if code == 438 && attempt == 0 {
+                    if let Some(new_nonce) = resp.get_nonce() {
+                        tracing::debug!("stale nonce on ChannelBind, retrying");
+                        self.server_nonce = Some(new_nonce.to_string());
+                        continue;
+                    }
+                }
+
+                return Err(SessionError::TurnError {
+                    code,
+                    reason: reason.to_string(),
+                });
+            }
+
+            self.state = SessionState::Active;
+            self.last_channel_refresh = Some(Instant::now());
+            return Ok(());
         }
 
-        self.state = SessionState::Active;
-        self.last_channel_refresh = Some(Instant::now());
-        Ok(())
+        Err(SessionError::TurnError {
+            code: 438,
+            reason: "stale nonce persisted on ChannelBind".into(),
+        })
     }
 
     pub async fn send_data(&self, payload: &[u8]) -> Result<(), SessionError> {
@@ -342,8 +437,13 @@ impl TurnSession {
     }
 
     pub async fn recv_event(&mut self) -> Result<TurnEvent, SessionError> {
+        // Drain any data buffered during a prior recv_stun_response call
+        if let Some(data) = self.pending_data.pop_front() {
+            return Ok(TurnEvent::Data(data));
+        }
+
         loop {
-            let (frame, _src) = self.rx.recv().await?;
+            let (frame, _src) = self.recv_frame().await?;
 
             match demux(&frame) {
                 PacketType::ChannelData => {
@@ -426,6 +526,57 @@ impl TurnSession {
         res
     }
 
+    /// Attempt to reconnect the transport and re-establish the full TURN session.
+    pub async fn reconnect(&mut self) -> Result<(), SessionError> {
+        let max_attempts = self.config.max_reconnect_attempts;
+        let delay = self.config.reconnect_delay;
+
+        for attempt in 1..=max_attempts {
+            tracing::warn!(attempt, max_attempts, "attempting reconnection");
+
+            tokio::time::sleep(delay).await;
+
+            match crate::transport::connect(
+                self.config.credentials.server_addr,
+                &self.config.protocol,
+            )
+            .await
+            {
+                Ok((tx, rx)) => {
+                    self.tx = tx;
+                    self.rx = rx;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "transport reconnect failed");
+                    continue;
+                }
+            }
+
+            self.state = SessionState::Init;
+            self.server_nonce = None;
+            self.allocation = None;
+            self.last_permission_refresh = None;
+            self.last_channel_refresh = None;
+            self.pending_data.clear();
+
+            match self.establish().await {
+                Ok(()) => {
+                    tracing::info!(attempt, "reconnection successful");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "re-establish failed");
+                    continue;
+                }
+            }
+        }
+
+        self.state = SessionState::Failed;
+        Err(SessionError::ReconnectFailed {
+            attempts: max_attempts,
+        })
+    }
+
     fn add_auth_attrs(&self, msg: &mut StunMessage) {
         msg.add(Attribute::Username(
             self.config.credentials.username.clone(),
@@ -435,6 +586,39 @@ impl TurnSession {
         }
         if let Some(ref n) = self.server_nonce {
             msg.add(Attribute::Nonce(n.clone()));
+        }
+    }
+
+    /// Low-level receive that detects disconnection for stream transports.
+    async fn recv_frame(&mut self) -> Result<(Bytes, SocketAddr), SessionError> {
+        match self.rx.recv().await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("closed") || msg.contains("broken pipe") || msg.contains("reset") {
+                    Err(SessionError::Disconnected)
+                } else {
+                    Err(SessionError::Transport(e))
+                }
+            }
+        }
+    }
+
+    /// Low-level receive with timeout. Returns None on timeout.
+    async fn recv_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(Bytes, SocketAddr)>, SessionError> {
+        match self.rx.recv_timeout(timeout).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("closed") || msg.contains("broken pipe") || msg.contains("reset") {
+                    Err(SessionError::Disconnected)
+                } else {
+                    Err(SessionError::Transport(e))
+                }
+            }
         }
     }
 
@@ -453,33 +637,45 @@ impl TurnSession {
                 return Err(SessionError::Timeout);
             }
 
-            let (frame, _) = match self.rx.recv_timeout(rem).await? {
+            let (frame, _) = match self.recv_frame_timeout(rem).await? {
                 Some(r) => r,
                 None => return Err(SessionError::Timeout),
             };
 
-            if demux(&frame) != PacketType::Stun {
-                continue;
-            }
-            let msg = match StunMessage::decode(&frame) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            match demux(&frame) {
+                PacketType::ChannelData => {
+                    // Buffer the ChannelData so it isn't lost
+                    match ChannelData::decode(&frame) {
+                        Ok(cd) => {
+                            self.pending_data.push_back(cd.data);
+                        }
+                        Err(e) => {
+                            tracing::trace!("ignoring malformed ChannelData during STUN wait: {e}");
+                        }
+                    }
+                    continue;
+                }
+                PacketType::Stun => {
+                    let msg = match StunMessage::decode(&frame) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
 
-            if msg.transaction_id != *tid {
-                continue;
+                    if msg.transaction_id != *tid {
+                        continue;
+                    }
+                    if msg.method != expected_method {
+                        return Err(SessionError::UnexpectedResponse {
+                            expected: expected_method,
+                            got: msg.method,
+                        });
+                    }
+                    return Ok(msg);
+                }
+                _ => continue,
             }
-            if msg.method != expected_method {
-                return Err(SessionError::UnexpectedResponse {
-                    expected: expected_method,
-                    got: msg.method,
-                });
-            }
-            return Ok(msg);
         }
     }
-
-    // --- public accessors ---
 
     pub fn state(&self) -> SessionState {
         self.state
@@ -490,12 +686,10 @@ impl TurnSession {
     }
 
     pub fn allocation_info(&self) -> Option<&AllocationInfo> {
-        // <-- was missing
         self.allocation.as_ref()
     }
 
     pub fn time_until_expiry(&self) -> Option<Duration> {
-        // <-- was missing
         self.allocation.as_ref().map(|a| {
             let total = Duration::from_secs(a.lifetime as u64);
             total

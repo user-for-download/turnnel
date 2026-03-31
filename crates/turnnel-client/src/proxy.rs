@@ -1,10 +1,12 @@
-// FILE: crates/turnnel-client/src/proxy.rs
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::signal;
 use turnnel_session::transport::TransportProtocol;
 
-use turnnel_session::session::{SessionConfig, TurnCredentials, TurnEvent, TurnSession};
+use turnnel_session::session::{
+    SessionConfig, SessionError, TurnCredentials, TurnEvent, TurnSession,
+};
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -18,7 +20,7 @@ pub struct ProxyConfig {
 pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
     let session_config = SessionConfig::new(
         config.credentials.clone(),
-        config.protocol.clone(), // <-- was missing
+        config.protocol.clone(),
         config.peer_addr,
     );
 
@@ -37,9 +39,24 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
     let wg_socket = UdpSocket::bind(config.listen_addr).await?;
     tracing::info!(listen = %config.listen_addr, "WireGuard proxy ready");
 
+    let result = run_data_loop(&mut session, &wg_socket, config.refresh_interval).await;
+
+    tracing::info!("shutting down, releasing TURN allocation");
+    if let Err(e) = session.deallocate().await {
+        tracing::debug!("deallocate failed: {e}");
+    }
+
+    result
+}
+
+async fn run_data_loop(
+    session: &mut TurnSession,
+    wg_socket: &UdpSocket,
+    refresh_interval: Duration,
+) -> anyhow::Result<()> {
     let mut wg_client: Option<SocketAddr> = None;
     let mut wg_buf = [0u8; 65535];
-    let mut refresh_timer = tokio::time::interval(config.refresh_interval);
+    let mut refresh_timer = tokio::time::interval(refresh_interval);
     refresh_timer.tick().await;
 
     loop {
@@ -47,47 +64,80 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
             result = wg_socket.recv_from(&mut wg_buf) => {
                 let (n, src) = result?;
                 wg_client = Some(src);
-                session.send_data(&wg_buf[..n]).await?;
+                match session.send_data(&wg_buf[..n]).await {
+                    Ok(()) => {}
+                    Err(SessionError::Disconnected) => {
+                        tracing::warn!("transport disconnected during send, attempting reconnect");
+                        session.reconnect().await?;
+                        session.send_data(&wg_buf[..n]).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
 
             result = session.recv_event() => {
-                match result? {
-                    TurnEvent::Data(data) => {
+                match result {
+                    Ok(TurnEvent::Data(data)) => {
                         if let Some(client) = wg_client {
                             wg_socket.send_to(&data, client).await?;
                         }
                     }
-                    TurnEvent::StunResponse(msg) => {
+                    Ok(TurnEvent::StunResponse(msg)) => {
                         tracing::trace!(
                             method = ?msg.method,
                             class = ?msg.class,
                             "unexpected STUN response in data loop"
                         );
                     }
+                    Err(SessionError::Disconnected) => {
+                        tracing::warn!("transport disconnected during recv, attempting reconnect");
+                        session.reconnect().await?;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
 
             _ = refresh_timer.tick() => {
                 if session.needs_allocation_refresh() {
                     tracing::debug!("refreshing allocation");
-                    if let Err(e) = session.refresh_allocation().await {
-                        tracing::warn!("allocation refresh failed: {e}");
+                    match session.refresh_allocation().await {
+                        Ok(()) => {}
+                        Err(SessionError::Disconnected) => {
+                            tracing::warn!("disconnected during allocation refresh, reconnecting");
+                            session.reconnect().await?;
+                        }
+                        Err(e) => tracing::warn!("allocation refresh failed: {e}"),
                     }
                 }
 
                 if session.needs_permission_refresh() {
                     tracing::debug!("refreshing permission");
-                    if let Err(e) = session.refresh_permission().await {
-                        tracing::warn!("permission refresh failed: {e}");
+                    match session.refresh_permission().await {
+                        Ok(()) => {}
+                        Err(SessionError::Disconnected) => {
+                            tracing::warn!("disconnected during permission refresh, reconnecting");
+                            session.reconnect().await?;
+                        }
+                        Err(e) => tracing::warn!("permission refresh failed: {e}"),
                     }
                 }
 
                 if session.needs_channel_refresh() {
                     tracing::debug!("refreshing channel");
-                    if let Err(e) = session.refresh_channel().await {
-                        tracing::warn!("channel refresh failed: {e}");
+                    match session.refresh_channel().await {
+                        Ok(()) => {}
+                        Err(SessionError::Disconnected) => {
+                            tracing::warn!("disconnected during channel refresh, reconnecting");
+                            session.reconnect().await?;
+                        }
+                        Err(e) => tracing::warn!("channel refresh failed: {e}"),
                     }
                 }
+            }
+
+            _ = signal::ctrl_c() => {
+                tracing::info!("received Ctrl+C, stopping");
+                return Ok(());
             }
         }
     }
@@ -183,7 +233,7 @@ mod tests {
                                 let mut r =
                                     StunMessage::new(Method::Refresh, Class::SuccessResponse);
                                 r.transaction_id = msg.transaction_id;
-                                r.add(Attribute::Lifetime(600));
+                                r.add(Attribute::Lifetime(msg.get_lifetime().unwrap_or(600)));
                                 r
                             }
                             _ => continue,
@@ -229,7 +279,7 @@ mod tests {
             },
             peer_addr: SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9999),
             refresh_interval: Duration::from_secs(30),
-            protocol: TransportProtocol::Udp, // <-- was missing
+            protocol: TransportProtocol::Udp,
         };
 
         let proxy_handle = tokio::spawn(async move {

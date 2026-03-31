@@ -13,6 +13,46 @@ Uses TURN servers from video-calling services (VK Calls, Yandex Telemost) or any
 └──────────┘     └────────────┘     └─────────────┘     └──────────┘     └──────────┘
    :51821           Allocate +                             :9999           :51820
                     ChannelBind
+server:                    
+[VPS] Starting echo server on :15820...
+echo: listening on 127.0.0.1:15820
+[ OK] Echo server running (PID 3979492)
+────────────────────────────────────────
+peer:  0.0.0.0:9999 → echo :15820
+Waiting for TURN-relayed packets...
+────────────────────────────────────────
+2026-03-31T08:07:14.268566Z  INFO turnnel: starting peer relay listen=0.0.0.0:9999 forward=127.0.0.1:15820
+2026-03-31T08:07:14.268815Z  INFO turnnel_peer::relay: external socket ready listen=0.0.0.0:9999
+2026-03-31T08:07:14.268910Z  INFO turnnel_peer::relay: WireGuard socket ready local=127.0.0.1:60998 forward=127.0.0.1:15820
+echo: 37B from ('127.0.0.1', 60998)
+echo: 37B from ('127.0.0.1', 60998)
+echo: 37B from ('127.0.0.1', 60998)
+echo: 37B from ('127.0.0.1', 60998)
+
+client:
+2026-03-31T08:06:52.239476Z  INFO turnnel_session::session: TURN session active relay=155.212.207.13:60798 peer=185.139.230.73:9999 channel=0x4000 protocol=Udp
+2026-03-31T08:06:52.239492Z  INFO turnnel_client::proxy: TURN tunnel established relay=155.212.207.13:60798 peer=185.139.230.73:9999
+2026-03-31T08:06:52.239533Z  INFO turnnel_client::proxy: WireGuard proxy ready listen=127.0.0.1:51821
+
+[ OK ] TURN tunnel established via VK!
+
+[TEST] Sending test packets...
+Path: 127.0.0.1:51821 → VK TURN → 185.139.230.73:9999 → echo → back
+
+[ OK ] Packet 1/5: 37 bytes ✓
+[ OK ] Packet 2/5: 37 bytes ✓
+[ OK ] Packet 3/5: 37 bytes ✓
+[ OK ] Packet 4/5: 37 bytes ✓
+[ OK ] Packet 5/5: 37 bytes ✓
+
+[TEST] Burst test (10 packets)...
+[ OK ] Burst: 10/10 received ✓
+
+════════════════════════════════════════════
+ALL 6/6 PASSED — VK TURN TUNNEL WORKS! 🎉
+════════════════════════════════════════════
+
+[TEST] Cleaning up...
 ```
 
 1. **Client** allocates a relay on the TURN server, binds a channel to the peer
