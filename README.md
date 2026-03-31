@@ -1,6 +1,3 @@
-# `README.md`
-
-```markdown
 # Turnnel
 
 TURN-based tunnel for routing UDP traffic (e.g. WireGuard) through public TURN/STUN relays.
@@ -17,6 +14,57 @@ Uses TURN servers from video-calling services (VK Calls, Yandex Telemost) or any
    :51821           Allocate +                             :9999           :51820
                     ChannelBind
 ```
+
+## VK TURN: ~2 Mbps! need wg shape speed! 
+```text
+PostUp = tc qdisc add dev %i root tbf rate 1.8mbit burst 32kbit latency 50ms
+PostDown = tc qdisc del dev %i root 2>/dev/null || true
+```
+```bash
+❯ iperf3 -c 10.222.0.1
+Connecting to host 10.222.0.1, port 5201
+[  5] local 10.222.0.2 port 25878 connected to 10.222.0.1 port 5201
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   896 KBytes  7.33 Mbits/sec    0   40.9 KBytes
+[  5]   1.00-2.00   sec   384 KBytes  3.15 Mbits/sec    0   38.3 KBytes
+[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec    0   38.3 KBytes
+[  5]   3.00-4.00   sec   384 KBytes  3.15 Mbits/sec    0   38.3 KBytes
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec    0   38.3 KBytes
+[  5]   5.00-6.00   sec   384 KBytes  3.15 Mbits/sec    0   40.9 KBytes
+[  5]   6.00-7.00   sec   384 KBytes  3.14 Mbits/sec    0   40.9 KBytes
+[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec    0   38.3 KBytes
+[  5]   8.00-9.00   sec   384 KBytes  3.15 Mbits/sec    0   40.9 KBytes
+[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec    0   40.9 KBytes
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-10.00  sec  2.75 MBytes  2.31 Mbits/sec    0             sender
+[  5]   0.00-10.54  sec  2.12 MBytes  1.69 Mbits/sec                  receiver
+
+iperf Done.
+```
+```bash
+❯ iperf3 -s
+-----------------------------------------------------------
+Server listening on 5201
+-----------------------------------------------------------
+Accepted connection from 10.222.0.2, port 25864
+[  5] local 10.222.0.1 port 5201 connected to 10.222.0.2 port 25878
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.92   sec   384 KBytes  1.64 Mbits/sec
+[  5]   1.92-3.13   sec   256 KBytes  1.73 Mbits/sec
+[  5]   3.13-4.94   sec   384 KBytes  1.73 Mbits/sec
+[  5]   4.94-6.16   sec   256 KBytes  1.72 Mbits/sec
+[  5]   6.16-7.97   sec   384 KBytes  1.73 Mbits/sec
+[  5]   7.97-9.18   sec   256 KBytes  1.73 Mbits/sec
+[  5]   9.18-10.54  sec   256 KBytes  1.55 Mbits/sec
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-10.54  sec  2.12 MBytes  1.69 Mbits/sec                  receiver
+-----------------------------------------------------------
+Server listening on 5201
+-----------------------------------------------------------
+```
+
 
 1. **Client** allocates a relay on the TURN server, binds a channel to the peer
 2. **Peer** listens for relayed packets and forwards them to the local WireGuard
@@ -297,8 +345,3 @@ const OK_APP_KEY:       &str = "_________________";
 ## Status
 
 **Beta** — core tunnel works, tested end-to-end with VK TURN servers.
-
-## License
-
-MIT
-```
