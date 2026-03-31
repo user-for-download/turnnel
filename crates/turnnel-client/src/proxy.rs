@@ -23,14 +23,21 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
     run_inner(config, wg_socket).await
 }
 
-// Issue 2: accept a pre-bound socket to eliminate the TOCTOU race in tests
+// Issue 5: validate that the pre-bound socket matches config.listen_addr
 pub async fn run_with_listener(config: ProxyConfig, wg_socket: UdpSocket) -> anyhow::Result<()> {
-    tracing::info!(listen = %wg_socket.local_addr()?, "WireGuard proxy ready (pre-bound)");
+    let actual = wg_socket.local_addr()?;
+    if actual != config.listen_addr {
+        tracing::warn!(
+            configured = %config.listen_addr,
+            actual = %actual,
+            "listen address mismatch, using socket's actual address"
+        );
+    }
+    tracing::info!(listen = %actual, "WireGuard proxy ready (pre-bound)");
     run_inner(config, wg_socket).await
 }
 
 async fn run_inner(config: ProxyConfig, wg_socket: UdpSocket) -> anyhow::Result<()> {
-    // Issue 11: take ownership instead of cloning
     let refresh_interval = config.refresh_interval;
     let peer_addr = config.peer_addr;
 
@@ -274,7 +281,6 @@ mod tests {
     async fn test_proxy_roundtrip() {
         let turn_addr = start_mock_turn().await;
 
-        // Issue 2: bind once and pass the socket directly — no TOCTOU race
         let wg_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = wg_socket.local_addr().unwrap();
 

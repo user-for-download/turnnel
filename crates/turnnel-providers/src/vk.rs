@@ -24,7 +24,6 @@ const OK_API_URL: &str = "https://calls.okcdn.ru/fb.do";
 const OK_APP_KEY: &str = "CGMMEJLGDIHBABABA";
 
 const OK_SESSION_VERSION: u32 = 2;
-// Issue 9: use f64 constant so the type matches how it's used in serde_json::json!
 const OK_CLIENT_VERSION: f64 = 1.1;
 const OK_CLIENT_TYPE: &str = "SDK_JS";
 const OK_PROTOCOL_VERSION: &str = "5";
@@ -48,6 +47,7 @@ pub struct VkProvider {
 impl VkProvider {
     pub fn new(call_url: impl Into<String>, _cookie: Option<String>) -> anyhow::Result<Self> {
         let call_url: String = call_url.into();
+        // Issue 4: complete the format string
         let join_link = extract_join_link(&call_url).ok_or_else(|| {
             anyhow::anyhow!(
                 "could not extract join link from: {call_url}\n\
@@ -174,6 +174,7 @@ impl VkProvider {
     async fn step2_call_anon_token(&self, vk_token: &str) -> anyhow::Result<String> {
         let url = format!("{VK_CALLS_TOKEN_URL}?v={VK_API_VERSION}&client_id={VK_CLIENT_ID}");
 
+        // Issue 4: complete the URL format string
         let body = format!(
             "vk_join_link=https://vk.com/call/join/{}\
              &name=123\
@@ -210,7 +211,6 @@ impl VkProvider {
             .ok_or_else(|| anyhow::anyhow!("step 2: no response.token — {}", trunc(&resp, 300)))
     }
 
-    // Issue 9: use serde_json::json! consistently (matches auth_token_flow)
     async fn step3_ok_session_key(&self) -> anyhow::Result<String> {
         let device_id = uuid_v4();
 
@@ -294,7 +294,6 @@ impl VkProvider {
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl VkProvider {
-    // Issue 9: use serde_json::json! with the same typed constants
     async fn auth_token_flow(&self, auth_token: &str) -> anyhow::Result<TurnCredentials> {
         let device_id = uuid_v4();
         let session_data = serde_json::json!({

@@ -20,8 +20,12 @@ enum Command {
         /// Credential provider
         #[arg(long, default_value = "manual")]
         provider: String,
-
-        #[arg(long)]
+        #[arg(long, required_if_eq_any([
+            ("provider", "vk"),
+            ("provider", "yandex"),
+            ("provider", "meet"),
+            ("provider", "teams"),
+        ]))]
         call_url: Option<String>,
 
         #[arg(long)]

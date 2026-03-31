@@ -27,14 +27,6 @@ struct RelayEntry {
     packets: u64,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct PeerStats {
-    pub packets_from_relay: u64,
-    pub packets_to_relay: u64,
-    pub bytes_from_relay: u64,
-    pub bytes_to_relay: u64,
-    pub active_relays: usize,
-}
 
 pub async fn run(config: PeerConfig) -> anyhow::Result<()> {
     let external = UdpSocket::bind(config.listen_addr).await?;

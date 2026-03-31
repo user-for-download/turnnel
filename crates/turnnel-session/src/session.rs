@@ -22,7 +22,6 @@ pub struct TurnCredentials {
     pub realm: Option<String>,
 }
 
-// Issue 1: mask password in Debug output to prevent accidental leakage in logs
 impl std::fmt::Debug for TurnCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnCredentials")
@@ -192,6 +191,9 @@ impl TurnSession {
             .await
         {
             Ok(resp) => {
+                // Issue 7: update nonce even during deallocate (best-effort)
+                self.update_nonce_from(&resp);
+
                 if resp.class == Class::SuccessResponse {
                     tracing::info!("TURN allocation released");
                 } else {
@@ -225,6 +227,9 @@ impl TurnSession {
             .recv_stun_response(Method::Allocate, &req.transaction_id)
             .await?;
 
+        // Issue 6: always extract nonce from any response
+        self.update_nonce_from(&resp);
+
         if resp.class == Class::ErrorResponse {
             let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
 
@@ -252,7 +257,7 @@ impl TurnSession {
                 .to_string();
 
             self.server_realm = Some(realm.clone());
-            self.server_nonce = Some(nonce.clone());
+            // nonce already captured by update_nonce_from above
 
             let effective_realm = self.config.credentials.realm.as_deref().unwrap_or(&realm);
             self.hmac_key = Some(long_term_key(
@@ -297,6 +302,9 @@ impl TurnSession {
             .recv_stun_response(Method::Allocate, &req.transaction_id)
             .await?;
 
+        // Issue 6: always extract nonce from any response
+        self.update_nonce_from(&resp);
+
         if resp.class == Class::ErrorResponse {
             let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
             return Err(SessionError::TurnError {
@@ -309,10 +317,7 @@ impl TurnSession {
     }
 
     fn handle_allocate_success(&mut self, resp: &StunMessage) -> Result<(), SessionError> {
-        // Issue 5: update nonce from any success response (RFC 5766 §7.3)
-        if let Some(nonce) = resp.get_nonce() {
-            self.server_nonce = Some(nonce.to_string());
-        }
+        // nonce already updated by caller via update_nonce_from
 
         let relay_addr = resp
             .get_xor_relayed_address()
@@ -349,15 +354,16 @@ impl TurnSession {
                 .recv_stun_response(Method::CreatePermission, &req.transaction_id)
                 .await?;
 
+            // Issue 6: always extract nonce before checking class
+            self.update_nonce_from(&resp);
+
             if resp.class == Class::ErrorResponse {
                 let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
 
                 if code == 438 && attempt == 0 {
-                    if let Some(new_nonce) = resp.get_nonce() {
-                        tracing::debug!("stale nonce on CreatePermission, retrying");
-                        self.server_nonce = Some(new_nonce.to_string());
-                        continue;
-                    }
+                    // nonce already updated by update_nonce_from above
+                    tracing::debug!("stale nonce on CreatePermission, retrying");
+                    continue;
                 }
 
                 if code == 403 {
@@ -381,11 +387,6 @@ impl TurnSession {
                 self.state = SessionState::Permitted;
             }
             self.last_permission_refresh = Some(Instant::now());
-
-            // Issue 5: update nonce from success response
-            if let Some(nonce) = resp.get_nonce() {
-                self.server_nonce = Some(nonce.to_string());
-            }
 
             return Ok(());
         }
@@ -411,15 +412,16 @@ impl TurnSession {
                 .recv_stun_response(Method::ChannelBind, &req.transaction_id)
                 .await?;
 
+            // Issue 6: always extract nonce before checking class
+            self.update_nonce_from(&resp);
+
             if resp.class == Class::ErrorResponse {
                 let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
 
                 if code == 438 && attempt == 0 {
-                    if let Some(new_nonce) = resp.get_nonce() {
-                        tracing::debug!("stale nonce on ChannelBind, retrying");
-                        self.server_nonce = Some(new_nonce.to_string());
-                        continue;
-                    }
+                    // nonce already updated by update_nonce_from above
+                    tracing::debug!("stale nonce on ChannelBind, retrying");
+                    continue;
                 }
 
                 return Err(SessionError::TurnError {
@@ -431,11 +433,6 @@ impl TurnSession {
             self.state = SessionState::Active;
             self.last_channel_refresh = Some(Instant::now());
 
-            // Issue 5: update nonce from success response
-            if let Some(nonce) = resp.get_nonce() {
-                self.server_nonce = Some(nonce.to_string());
-            }
-
             return Ok(());
         }
 
@@ -445,9 +442,6 @@ impl TurnSession {
         })
     }
 
-    // Issue 4: &mut self is semantically correct for an I/O operation
-    // and prevents the compiler from allowing concurrent sends that could
-    // interleave channel data frames on TCP.
     pub async fn send_data(&mut self, payload: &[u8]) -> Result<(), SessionError> {
         if self.state != SessionState::Active {
             return Err(SessionError::WrongState {
@@ -517,14 +511,15 @@ impl TurnSession {
                 .recv_stun_response(Method::Refresh, &req.transaction_id)
                 .await?;
 
+            // Issue 6: always extract nonce before checking class
+            self.update_nonce_from(&resp);
+
             if resp.class == Class::ErrorResponse {
                 let (code, reason) = resp.get_error_code().unwrap_or((0, "unknown"));
 
                 if code == 438 && attempt == 0 {
-                    if let Some(new_nonce) = resp.get_nonce() {
-                        self.server_nonce = Some(new_nonce.to_string());
-                        continue;
-                    }
+                    // nonce already updated by update_nonce_from above
+                    continue;
                 }
 
                 return Err(SessionError::TurnError {
@@ -536,11 +531,6 @@ impl TurnSession {
             if let Some(ref mut alloc) = self.allocation {
                 alloc.lifetime = resp.get_lifetime().unwrap_or(alloc.lifetime);
                 alloc.allocated_at = Instant::now();
-            }
-
-            // Issue 5: update nonce from success response
-            if let Some(nonce) = resp.get_nonce() {
-                self.server_nonce = Some(nonce.to_string());
             }
 
             return Ok(());
@@ -579,7 +569,7 @@ impl TurnSession {
                 self.config.credentials.server_addr,
                 &self.config.protocol,
             )
-            .await
+                .await
             {
                 Ok((tx, rx)) => {
                     self.tx = tx;
@@ -628,12 +618,19 @@ impl TurnSession {
         }
     }
 
+    /// Issue 6: centralised nonce extraction — call after every recv_stun_response.
+    /// RFC 5766 §7.3 allows the server to rotate nonces in any response.
+    fn update_nonce_from(&mut self, resp: &StunMessage) {
+        if let Some(nonce) = resp.get_nonce() {
+            self.server_nonce = Some(nonce.to_string());
+        }
+    }
+
     /// Low-level receive that detects disconnection for stream transports.
     async fn recv_frame(&mut self) -> Result<(Bytes, SocketAddr), SessionError> {
         match self.rx.recv().await {
             Ok(r) => Ok(r),
             Err(e) => {
-                // Issue 8: use io::ErrorKind instead of string matching
                 if is_disconnect_error(&e) {
                     Err(SessionError::Disconnected)
                 } else {
@@ -651,7 +648,6 @@ impl TurnSession {
         match self.rx.recv_timeout(timeout).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                // Issue 8: use io::ErrorKind instead of string matching
                 if is_disconnect_error(&e) {
                     Err(SessionError::Disconnected)
                 } else {
@@ -686,7 +682,6 @@ impl TurnSession {
                     // Buffer the ChannelData so it isn't lost
                     match ChannelData::decode(&frame) {
                         Ok(cd) => {
-                            // Issue 3: cap pending_data to prevent OOM
                             if self.pending_data.len() < MAX_PENDING_DATA {
                                 self.pending_data.push_back(cd.data);
                             } else {
@@ -742,7 +737,6 @@ impl TurnSession {
         })
     }
 
-    // Issue 12: guard against lifetime 0 to prevent refresh storms
     pub fn needs_allocation_refresh(&self) -> bool {
         self.allocation
             .as_ref()
@@ -766,7 +760,6 @@ impl TurnSession {
     }
 }
 
-// Issue 8: detect disconnection via io::ErrorKind rather than string matching
 fn is_disconnect_error(e: &anyhow::Error) -> bool {
     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
         matches!(
