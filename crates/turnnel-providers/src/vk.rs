@@ -1,10 +1,10 @@
-use std::fs;
+use std::fmt::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, ORIGIN, REFERER, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,35 +12,64 @@ use turnnel_session::session::TurnCredentials;
 
 use crate::CredentialProvider;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-                   AppleWebKit/537.36 (KHTML, like Gecko) \
-                   Chrome/146.0.0.0 Safari/537.36";
+// ═══════════════════════════════════════════════════════════════════════════
+//  Constants — extracted from the VK Calls browser JS bundle.
+//  If VK updates their app, change these values.
+// ═══════════════════════════════════════════════════════════════════════════
 
-/// OK (Odnoklassniki) federation API
-const OK_FB_API: &str = "https://fb.do/api";
+const VK_CLIENT_ID: &str = "6287487";
+const VK_CLIENT_SECRET: &str = "QbYic1K3lEV5kTGiqlq2";
+const VK_APP_ID: &str = "6287487";
+const VK_API_VERSION: &str = "5.274";
+
+const VK_ANON_TOKEN_URL: &str = "https://login.vk.ru/?act=get_anonym_token";
+const VK_CALLS_TOKEN_URL: &str = "https://api.vk.ru/method/calls.getAnonymousToken";
+
+const OK_API_URL: &str = "https://calls.okcdn.ru/fb.do";
 const OK_APP_KEY: &str = "CGMMEJLGDIHBABABA";
 
+const OK_SESSION_VERSION: u32 = 2;
+const OK_CLIENT_VERSION: &str = "1.1";
+const OK_CLIENT_TYPE: &str = "SDK_JS";
+const OK_PROTOCOL_VERSION: &str = "5";
+
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) \
+                   Gecko/20100101 Firefox/144.0";
+const FORM_CT: &str = "application/x-www-form-urlencoded";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Provider
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub struct VkProvider {
-    pub call_url: String,
-    pub cookie: Option<String>,
-    pub auth_token: Option<String>,
+    join_link: String,
+    call_url: String,
+    auth_token: Option<String>,
     client: Client,
 }
 
 impl VkProvider {
-    pub fn new(call_url: impl Into<String>, cookie: Option<String>) -> anyhow::Result<Self> {
+    pub fn new(call_url: impl Into<String>, _cookie: Option<String>) -> anyhow::Result<Self> {
+        let call_url: String = call_url.into();
+        let join_link = extract_join_link(&call_url).ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not extract join link from: {call_url}\n\
+                 Expected format: https://vk.com/call/join/XXXXX"
+            )
+        })?;
+
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-        if let Some(ref c) = cookie {
-            headers.insert(COOKIE, HeaderValue::from_str(c)?);
-        }
+
         let client = Client::builder()
             .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .timeout(HTTP_TIMEOUT)
             .build()?;
+
         Ok(Self {
-            call_url: call_url.into(),
-            cookie,
+            join_link,
+            call_url,
             auth_token: None,
             client,
         })
@@ -64,78 +93,219 @@ impl CredentialProvider for VkProvider {
     }
 
     async fn obtain(&self) -> anyhow::Result<TurnCredentials> {
-        let url = &self.call_url;
-
-        if Path::new(url).exists() && url.ends_with(".json") {
-            tracing::info!(file = url, "treating call_url as local JSON file");
-            let body = fs::read_to_string(url)?;
-            return parse_turn_response(&body);
+        tracing::info!(link = %self.join_link, "trying anonymous VK Calls flow");
+        match self.anonymous_flow().await {
+            Ok(creds) => return Ok(creds),
+            Err(e) => tracing::warn!("anonymous flow failed: {e:#}"),
         }
 
-        tracing::info!(url, "fetching VK call page");
-        let body = self.client.get(url).send().await?.text().await?;
-
-        let auth_token = self
-            .auth_token
-            .clone()
-            .or_else(|| find_ok_auth_token_in_page(&body));
-        let join_link = find_ok_join_link_in_page(&body).or_else(|| extract_ok_join_link(url));
-
-        if let (Some(token), Some(link)) = (&auth_token, &join_link) {
-            tracing::info!("found OK auth_token + join_link, trying OK API flow");
-            match self.ok_api_join(token, link).await {
-                Ok(c) => return Ok(c),
-                Err(e) => tracing::warn!("OK API flow failed: {e}"),
+        if let Some(ref token) = self.auth_token {
+            tracing::info!("trying auth_token-based OK API flow");
+            match self.auth_token_flow(token).await {
+                Ok(creds) => return Ok(creds),
+                Err(e) => tracing::warn!("auth_token flow failed: {e:#}"),
             }
         }
 
-        if let Some(c) = try_turn_server_json(&body)? {
-            return Ok(c);
-        }
-        if let Some(c) = try_ice_servers(&body)? {
-            return Ok(c);
-        }
-
-        if body.contains("login") || body.contains("al_login") || body.contains("act=login") {
-            anyhow::bail!(
-                "VK requires authentication (page redirected to login).\n\
-                 \n\
-                 SOLUTION: Provide the OK auth_token from your browser.\n\
-                 1. Open the call in your browser\n\
-                 2. Open DevTools -> Console\n\
-                 3. Type: `window.config.auth_token` or look in the Network tab for requests to fb.do\n\
-                 4. Run turnnel with: --auth-token \"$YOUR_TOKEN\""
-            );
+        tracing::info!(url = %self.call_url, "trying page-scraping fallback");
+        match self.page_scrape_flow().await {
+            Ok(creds) => return Ok(creds),
+            Err(e) => tracing::warn!("page scraping failed: {e:#}"),
         }
 
-        anyhow::bail!("Could not find call data in VK page.")
+        anyhow::bail!(
+            "all VK credential flows failed for link '{}'\n\n\
+             Possible causes:\n\
+             • The call link has expired or is invalid\n\
+             • VK has changed their API (update constants in vk.rs)\n\
+             • Network issues (VK/OK domains may be blocked)\n\n\
+             You can also try: --auth-token <TOKEN>",
+            self.join_link
+        )
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Anonymous 4-step flow
+// ═══════════════════════════════════════════════════════════════════════════
+
 impl VkProvider {
-    async fn ok_api_join(
+    async fn anonymous_flow(&self) -> anyhow::Result<TurnCredentials> {
+        let vk_token = self.step1_vk_anon_token().await?;
+        tracing::debug!("step 1/4 ✓  VK anon access_token");
+
+        let anonym_token = self.step2_call_anon_token(&vk_token).await?;
+        tracing::debug!("step 2/4 ✓  call anonymToken");
+
+        let session_key = self.step3_ok_session_key().await?;
+        tracing::debug!("step 3/4 ✓  OK session_key");
+
+        let creds = self.step4_join_call(&anonym_token, &session_key).await?;
+        tracing::debug!("step 4/4 ✓  TURN credentials");
+
+        Ok(creds)
+    }
+
+    async fn step1_vk_anon_token(&self) -> anyhow::Result<String> {
+        let body = format!(
+            "client_id={VK_CLIENT_ID}\
+             &token_type=messages\
+             &client_secret={VK_CLIENT_SECRET}\
+             &version=1\
+             &app_id={VK_APP_ID}"
+        );
+
+        let text = self
+            .client
+            .post(VK_ANON_TOKEN_URL)
+            .header("Content-Type", FORM_CT)
+            .body(body)
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let resp: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("step 1: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+
+        resp["data"]["access_token"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("step 1: no data.access_token — {}", trunc(&resp, 300)))
+    }
+
+    async fn step2_call_anon_token(&self, vk_token: &str) -> anyhow::Result<String> {
+        let url = format!("{VK_CALLS_TOKEN_URL}?v={VK_API_VERSION}&client_id={VK_CLIENT_ID}");
+
+        let body = format!(
+            "vk_join_link=https://vk.com/call/join/{}\
+             &name=123\
+             &access_token={vk_token}",
+            self.join_link
+        );
+
+        let text = self
+            .client
+            .post(&url)
+            .header("Content-Type", FORM_CT)
+            .body(body)
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let resp: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("step 2: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err
+                .get("error_msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            let code = err.get("error_code").and_then(|c| c.as_u64()).unwrap_or(0);
+            anyhow::bail!("step 2: VK API error {code}: {msg}");
+        }
+
+        resp["response"]["token"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("step 2: no response.token — {}", trunc(&resp, 300)))
+    }
+
+    async fn step3_ok_session_key(&self) -> anyhow::Result<String> {
+        let device_id = uuid_v4();
+
+        let session_json = format!(
+            r#"{{"version":{OK_SESSION_VERSION},"device_id":"{device_id}","client_version":{OK_CLIENT_VERSION},"client_type":"{OK_CLIENT_TYPE}"}}"#
+        );
+
+        let body = format!(
+            "session_data={}\
+             &method=auth.anonymLogin\
+             &format=JSON\
+             &application_key={OK_APP_KEY}",
+            percent_encode(&session_json)
+        );
+
+        let text = self
+            .client
+            .post(OK_API_URL)
+            .header("Content-Type", FORM_CT)
+            .body(body)
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let resp: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("step 3: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+
+        resp["session_key"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("step 3: no session_key — {}", trunc(&resp, 300)))
+    }
+
+    async fn step4_join_call(
         &self,
-        auth_token: &str,
-        join_link: &str,
+        anonym_token: &str,
+        session_key: &str,
     ) -> anyhow::Result<TurnCredentials> {
+        let body = format!(
+            "joinLink={}\
+             &isVideo=false\
+             &protocolVersion={OK_PROTOCOL_VERSION}\
+             &anonymToken={anonym_token}\
+             &method=vchat.joinConversationByLink\
+             &format=JSON\
+             &application_key={OK_APP_KEY}\
+             &session_key={session_key}",
+            self.join_link
+        );
+
+        let text = self
+            .client
+            .post(OK_API_URL)
+            .header("Content-Type", FORM_CT)
+            .body(body)
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let resp: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("step 4: invalid JSON: {e}\nbody: {}", trunc_str(&text, 300)))?;
+
+        if let Some(msg) = resp.get("error_msg").and_then(|m| m.as_str()) {
+            anyhow::bail!("step 4: OK API error: {msg}");
+        }
+
+        parse_turn_from_value(&resp)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Fallback flows
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl VkProvider {
+    async fn auth_token_flow(&self, auth_token: &str) -> anyhow::Result<TurnCredentials> {
+        let device_id = uuid_v4();
         let session_data = serde_json::json!({
-            "version": 3,
-            "device_id": generate_device_id(),
+            "version": OK_SESSION_VERSION,
+            "device_id": device_id,
             "client_version": 1.1,
-            "client_type": "SDK_JS",
+            "client_type": OK_CLIENT_TYPE,
             "auth_token": auth_token,
         });
+        let sd_str = serde_json::to_string(&session_data)?;
 
-        let login_resp = self
+        let login_text = self
             .client
-            .post(OK_FB_API)
-            .header(ORIGIN, "https://vk.com")
-            .header(REFERER, "https://vk.com/")
+            .post(OK_API_URL)
+            .header("Content-Type", FORM_CT)
             .form(&[
-                (
-                    "session_data",
-                    serde_json::to_string(&session_data)?.as_str(),
-                ),
+                ("session_data", sd_str.as_str()),
                 ("method", "auth.anonymLogin"),
                 ("format", "JSON"),
                 ("application_key", OK_APP_KEY),
@@ -145,92 +315,202 @@ impl VkProvider {
             .text()
             .await?;
 
-        let session_key = extract_session_key(&login_resp)?;
+        let login_resp: Value = serde_json::from_str(&login_text)
+            .map_err(|e| anyhow::anyhow!("auth flow login: invalid JSON: {e}"))?;
 
-        let join_resp = self
+        let session_key = login_resp["session_key"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no session_key: {}", trunc(&login_resp, 200)))?;
+
+        let join_text = self
             .client
-            .post(OK_FB_API)
-            .header(ORIGIN, "https://vk.com")
-            .header(REFERER, "https://vk.com/")
+            .post(OK_API_URL)
+            .header("Content-Type", FORM_CT)
             .form(&[
-                ("joinLink", join_link),
+                ("joinLink", self.join_link.as_str()),
                 ("isVideo", "false"),
-                ("protocolVersion", "5"),
-                ("capabilities", "2F7F"),
+                ("protocolVersion", OK_PROTOCOL_VERSION),
                 ("method", "vchat.joinConversationByLink"),
                 ("format", "JSON"),
                 ("application_key", OK_APP_KEY),
-                ("session_key", &session_key),
+                ("session_key", session_key),
             ])
             .send()
             .await?
             .text()
             .await?;
 
-        parse_turn_response(&join_resp)
+        let join_resp: Value = serde_json::from_str(&join_text)
+            .map_err(|e| anyhow::anyhow!("auth flow join: invalid JSON: {e}"))?;
+
+        parse_turn_from_value(&join_resp)
+    }
+
+    async fn page_scrape_flow(&self) -> anyhow::Result<TurnCredentials> {
+        let body = self.client.get(&self.call_url).send().await?.text().await?;
+
+        if let Some(c) = try_turn_server_json(&body)? {
+            return Ok(c);
+        }
+        if let Some(c) = try_ice_servers(&body)? {
+            return Ok(c);
+        }
+
+        if body.contains("act=login") || body.contains("al_login") {
+            anyhow::bail!("page redirected to login — try --auth-token");
+        }
+
+        anyhow::bail!("no TURN data found in page HTML")
     }
 }
 
-fn find_ok_auth_token_in_page(body: &str) -> Option<String> {
-    let re1 = Regex::new(r#""(?:auth_token|token)"\s*:\s*"(\$[a-zA-Z0-9_-]+)""#).ok()?;
-    if let Some(caps) = re1.captures(body) {
-        return Some(caps.get(1).unwrap().as_str().to_string());
+// ═══════════════════════════════════════════════════════════════════════════
+//  TURN response parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn parse_turn_from_value(resp: &Value) -> anyhow::Result<TurnCredentials> {
+    let ts = resp
+        .get("turn_server")
+        .ok_or_else(|| anyhow::anyhow!("no turn_server in response: {}", trunc(resp, 300)))?;
+
+    let username = ts["username"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no turn_server.username"))?;
+
+    let credential = ts["credential"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no turn_server.credential"))?;
+
+    let url_raw = ts["urls"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no turn_server.urls[0]"))?;
+
+    let clean = url_raw.split('?').next().unwrap_or(url_raw);
+    let address = clean
+        .strip_prefix("turns:")
+        .or_else(|| clean.strip_prefix("turn:"))
+        .unwrap_or(clean);
+
+    let addr = resolve(address)?;
+    tracing::info!(server = %addr, user = %username, "TURN credentials obtained");
+
+    Ok(TurnCredentials {
+        server_addr: addr,
+        username: username.to_string(),
+        password: credential.to_string(),
+        realm: None,
+    })
+}
+
+pub fn parse_turn_response(body: &str) -> anyhow::Result<TurnCredentials> {
+    let v: Value = serde_json::from_str(body)?;
+
+    if v.get("turn_server").is_some() {
+        return parse_turn_from_value(&v);
     }
-    let re2 = Regex::new(r#""(\$[a-zA-Z0-9_-]{30,})""#).ok()?;
-    re2.captures(body)
-        .map(|c| c.get(1).unwrap().as_str().to_string())
+    if let Some(inner) = v.get("response") {
+        if inner.get("turn_server").is_some() {
+            return parse_turn_from_value(inner);
+        }
+    }
+    if let Some(creds) = find_turn_server_recursive(&v)? {
+        return Ok(creds);
+    }
+
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("error_msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown");
+        let code = err.get("error_code").and_then(|c| c.as_u64()).unwrap_or(0);
+        anyhow::bail!("VK API error {code}: {msg}");
+    }
+    if let Some(msg) = v.get("error_msg").and_then(|m| m.as_str()) {
+        anyhow::bail!("OK API error: {msg}");
+    }
+
+    anyhow::bail!(
+        "no turn_server found (first 300 chars: {})",
+        &body[..body.len().min(300)]
+    )
 }
 
-fn find_ok_join_link_in_page(body: &str) -> Option<String> {
-    let re = Regex::new(r#"(?:joinLink|join_link|callLink)["':\s]+([a-zA-Z0-9_-]{20,})"#).ok()?;
-    re.captures(body)
-        .map(|c| c.get(1).unwrap().as_str().to_string())
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn extract_ok_join_link(url: &str) -> Option<String> {
-    let re = Regex::new(r#"vk\.com/call/join/([a-zA-Z0-9_-]+)"#).ok()?;
+fn extract_join_link(url: &str) -> Option<String> {
+    if !url.contains('/') && !url.contains(':') && !url.is_empty() {
+        let clean = url.split(|c: char| c == '?' || c == '#').next()?;
+        if !clean.is_empty() {
+            return Some(clean.to_string());
+        }
+    }
+    let re = Regex::new(r"(?:call/join/|join/)([a-zA-Z0-9_-]+)").ok()?;
     re.captures(url)
         .map(|c| c.get(1).unwrap().as_str().to_string())
 }
 
-fn extract_session_key(resp: &str) -> anyhow::Result<String> {
-    if let Ok(v) = serde_json::from_str::<Value>(resp) {
-        if let Some(key) = v.get("session_key").and_then(|k| k.as_str()) {
-            return Ok(key.to_string());
+fn uuid_v4() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let mut b = [0u8; 16];
+    rng.fill(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            s.push('-');
         }
-        if let Some(sd) = v.get("session_data") {
-            if let Some(key) = sd.get("session_key").and_then(|k| k.as_str()) {
-                return Ok(key.to_string());
+        write!(s, "{:02x}", byte).unwrap();
+    }
+    s
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                write!(out, "%{:02X}", byte).unwrap();
             }
         }
     }
-    anyhow::bail!(
-        "no session_key in response: {}",
-        &resp[..resp.len().min(200)]
-    )
+    out
 }
 
-fn generate_device_id() -> String {
-    use rand::Rng;
-    use std::fmt::Write;
-
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-
-    // UUID v4: version and variant bits
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    let mut id = String::with_capacity(36);
-    for (i, b) in bytes.iter().enumerate() {
-        if i == 4 || i == 6 || i == 8 || i == 10 {
-            id.push('-');
-        }
-        write!(id, "{:02x}", b).unwrap();
+fn trunc(v: &Value, max: usize) -> String {
+    let s = v.to_string();
+    if s.len() > max {
+        format!("{}…", &s[..max])
+    } else {
+        s
     }
-    id
 }
+
+fn trunc_str(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", &s[..max])
+    } else {
+        s.to_string()
+    }
+}
+
+fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+    address
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve {address}"))
+}
+
+// ── Page-scraping helpers ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct TurnServerObj {
@@ -244,56 +524,17 @@ struct TurnServerObj {
     credential: String,
 }
 
-pub fn parse_turn_response(body: &str) -> anyhow::Result<TurnCredentials> {
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        let root = if let Some(inner) = v.get("response") {
-            inner
-        } else {
-            &v
-        };
-        if let Some(creds) = find_turn_server_recursive(root)? {
-            return Ok(creds);
-        }
-    }
-
-    if let Some(creds) = try_turn_server_json(body)? {
-        return Ok(creds);
-    }
-    if let Some(creds) = try_ice_servers(body)? {
-        return Ok(creds);
-    }
-
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        if let Some(err) = v.get("error") {
-            let msg = err
-                .get("error_msg")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
-            let code = err.get("error_code").and_then(|c| c.as_u64()).unwrap_or(0);
-            anyhow::bail!("VK API error {code}: {msg}");
-        }
-        if let Some(err_msg) = v.get("error_msg").and_then(|m| m.as_str()) {
-            anyhow::bail!("OK API error: {err_msg}");
-        }
-    }
-
-    anyhow::bail!(
-        "no turn_server in response (first 300 chars: {})",
-        &body[..body.len().min(300)]
-    )
-}
-
 fn find_turn_server_recursive(v: &Value) -> anyhow::Result<Option<TurnCredentials>> {
     match v {
         Value::Object(map) => {
             if let Some(ts_val) = map.get("turn_server") {
                 if let Ok(ts) = serde_json::from_value::<TurnServerObj>(ts_val.clone()) {
-                    if let Ok(creds) = turn_server_to_creds(&ts) {
+                    if let Ok(creds) = turn_server_obj_to_creds(&ts) {
                         return Ok(Some(creds));
                     }
                 }
             }
-            for (_k, val) in map {
+            for val in map.values() {
                 if let Some(creds) = find_turn_server_recursive(val)? {
                     return Ok(Some(creds));
                 }
@@ -311,7 +552,7 @@ fn find_turn_server_recursive(v: &Value) -> anyhow::Result<Option<TurnCredential
     Ok(None)
 }
 
-fn turn_server_to_creds(ts: &TurnServerObj) -> anyhow::Result<TurnCredentials> {
+fn turn_server_obj_to_creds(ts: &TurnServerObj) -> anyhow::Result<TurnCredentials> {
     let mut all_urls = ts.urls.clone();
     if let Some(ref u) = ts.url {
         all_urls.push(u.clone());
@@ -323,12 +564,10 @@ fn turn_server_to_creds(ts: &TurnServerObj) -> anyhow::Result<TurnCredentials> {
     let turn_url = all_urls
         .iter()
         .find(|u| u.starts_with("turn:") || u.starts_with("turns:"))
-        .ok_or_else(|| anyhow::anyhow!("no turn: URL in {:?}", all_urls))?;
+        .ok_or_else(|| anyhow::anyhow!("no turn: URL in {all_urls:?}"))?;
 
     let (host, port, _tls) = crate::sdp::parse_turn_uri(turn_url)?;
-    let addr = resolve(&host, port)?;
-
-    tracing::info!(server = %addr, user = %ts.username, "VK TURN credentials obtained");
+    let addr = resolve(&format!("{host}:{port}"))?;
 
     Ok(TurnCredentials {
         server_addr: addr,
@@ -342,7 +581,7 @@ fn try_turn_server_json(body: &str) -> anyhow::Result<Option<TurnCredentials>> {
     let re = Regex::new(r#"(?si)"turn_server"\s*:\s*(\{[^}]+\})"#)?;
     if let Some(caps) = re.captures(body) {
         if let Ok(ts) = serde_json::from_str::<TurnServerObj>(caps.get(1).unwrap().as_str()) {
-            if let Ok(c) = turn_server_to_creds(&ts) {
+            if let Ok(c) = turn_server_obj_to_creds(&ts) {
                 return Ok(Some(c));
             }
         }
@@ -358,11 +597,4 @@ fn try_ice_servers(body: &str) -> anyhow::Result<Option<TurnCredentials>> {
         }
     }
     Ok(None)
-}
-
-fn resolve(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    format!("{host}:{port}")
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve {host}"))
 }
